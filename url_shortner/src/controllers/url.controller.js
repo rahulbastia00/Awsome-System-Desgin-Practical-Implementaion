@@ -3,7 +3,28 @@ const redis = require('../config/redis');
 const { isValidUrl } = require('../utils/validator');
 const { getNextShortCode } = require('../utils/base62');
 
-const CACHE_TTL_SECONDS = 86400; // 24 hours
+const DEFAULT_CACHE_TTL_SECONDS = 86400; // 24 hours
+
+/**
+ * Calculates Redis TTL considering expiration date.
+ * If URL expires sooner than default TTL, clamp to remaining seconds.
+ * Returns null if the URL has already expired.
+ *
+ * @param {Date|null} expiresAt
+ * @returns {number|null}
+ */
+function calculateCacheTtl(expiresAt) {
+  if (!expiresAt) {
+    return DEFAULT_CACHE_TTL_SECONDS;
+  }
+
+  const remainingSeconds = Math.floor((new Date(expiresAt).getTime() - Date.now()) / 1000);
+  if (remainingSeconds <= 0) {
+    return null; // Already expired, do not cache
+  }
+
+  return Math.min(remainingSeconds, DEFAULT_CACHE_TTL_SECONDS);
+}
 
 /**
  * POST /shorten
@@ -59,14 +80,11 @@ async function shortenUrl(req, res, next) {
       },
     });
 
-    // 5. Cache Warming in Redis (Cache-Aside proactive write)
-    // Only cache if the URL does not expire soon, or adjust TTL to match expiration
-    let cacheTtl = CACHE_TTL_SECONDS;
-    if (parsedExpiresAt) {
-      const secondsUntilExpiry = Math.floor((parsedExpiresAt.getTime() - Date.now()) / 1000);
-      cacheTtl = Math.max(1, Math.min(secondsUntilExpiry, CACHE_TTL_SECONDS));
+    // 5. Cache Warming with Expiration-Aware TTL (Cache Consistency)
+    const cacheTtl = calculateCacheTtl(parsedExpiresAt);
+    if (cacheTtl) {
+      await redis.setex(`link:${shortCode}`, cacheTtl, long_url);
     }
-    await redis.setex(`link:${shortCode}`, cacheTtl, long_url);
 
     const baseUrl = process.env.BASE_URL || `http://localhost:${process.env.PORT || 3000}`;
 
@@ -83,7 +101,7 @@ async function shortenUrl(req, res, next) {
 
 /**
  * GET /:short_code
- * Redirects to the original URL via Redis Cache-Aside + Decoupled Click Buffering
+ * Redirects to the original URL via Redis Cache-Aside + Expiration Consistency + Decoupled Click Buffering
  */
 async function redirectUrl(req, res, next) {
   try {
@@ -98,7 +116,7 @@ async function redirectUrl(req, res, next) {
         console.error('Redis click buffer error:', err.message);
       });
 
-      // Immediate 302 Redirect without touching PostgreSQL!
+      // Immediate 302 Redirect without hitting PostgreSQL!
       return res.redirect(302, cachedLongUrl);
     }
 
@@ -111,18 +129,18 @@ async function redirectUrl(req, res, next) {
       return res.status(404).json({ error: 'Short URL not found.' });
     }
 
-    // 3. Expiration Check
+    // 3. Expiration Check & Cache Invalidation
     if (record.expiresAt && new Date() > record.expiresAt) {
+      // Purge any stale cache entry for consistency
+      await redis.del(`link:${short_code}`);
       return res.status(410).json({ error: 'This short link has expired.' });
     }
 
-    // 4. Warm Redis Cache for future reads
-    let cacheTtl = CACHE_TTL_SECONDS;
-    if (record.expiresAt) {
-      const secondsUntilExpiry = Math.floor((record.expiresAt.getTime() - Date.now()) / 1000);
-      cacheTtl = Math.max(1, Math.min(secondsUntilExpiry, CACHE_TTL_SECONDS));
+    // 4. Warm Redis Cache with remaining TTL
+    const cacheTtl = calculateCacheTtl(record.expiresAt);
+    if (cacheTtl) {
+      await redis.setex(`link:${short_code}`, cacheTtl, record.longUrl);
     }
-    await redis.setex(`link:${short_code}`, cacheTtl, record.longUrl);
 
     // 5. Fire-and-forget in-memory click increment
     redis.incr(`clicks:${short_code}`).catch((err) => {
@@ -152,6 +170,7 @@ async function getAnalytics(req, res, next) {
         clicks: true,
         createdAt: true,
         lastAccessed: true,
+        expiresAt: true,
       },
     });
 
@@ -172,6 +191,7 @@ async function getAnalytics(req, res, next) {
       buffered_clicks: bufferedClicks,
       created_at: record.createdAt,
       last_accessed: record.lastAccessed,
+      expires_at: record.expiresAt,
     });
   } catch (error) {
     next(error);

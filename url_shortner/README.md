@@ -399,17 +399,19 @@ To address both bottlenecks and push throughput toward the **11,500+ req/sec** t
 
 5. **Run Benchmark Verification:** Measure latency and throughput under identical 100-connection load.
 
-
-
 ---
+
 ## 8. Milestone 2: Dual Read-Write Optimization & Concurrency Benchmarks
 
 ### 8.1 Architectural Enhancements Implemented
+
 1. **Atomic Sequence Generation:** Replaced speculative Base62 generation and database lookup loops with an atomic Redis counter (`INCR global_url_counter`), mapped directly to Base62 strings.
 2. **Proactive Cache Warming:** Upon link creation, the URL mapping is immediately written to Redis with a 24-hour TTL (`SETEX link:{code} 86400 {long_url}`), eliminating cold-start database queries on initial redirect.
 3. **Cache-Aside Redirection:** Read traffic resolves strictly against Redis memory. Cache misses fall back to PostgreSQL and backfill the cache.
 4. **Decoupled Asynchronous Analytics:** Redirects increment an in-memory counter (`INCR clicks:{code}`). A background worker flushes batched metrics to PostgreSQL every 10 seconds via non-blocking `SCAN` and `GETDEL`.
+
 ---
+
 ### 8.2 Pure Write Benchmark (`POST /shorten`)
 
 - **Load Profile:** 50 concurrent connections over 10 seconds.
@@ -432,3 +434,30 @@ To address both bottlenecks and push throughput toward the **11,500+ req/sec** t
 ### 8.4 Engineering Takeaway
 
 Decoupling the read and write paths using memory caching and asynchronous buffer flushes isolated CPU and I/O domains. Database disk writes no longer produce row-lock contention on active redirects, allowing both paths to exceed the project's capacity requirements on single-host hardware.
+
+
+---
+
+## 9. Milestone 3: Horizontal Clustering & Multi-Core Benchmarks
+
+### 9.1 Multi-Process Architecture
+
+- Converted `src/server.js` to utilize Node.js built-in `node:cluster` module.
+- Primary process supervises 4 worker processes distributing incoming TCP connections via OS Round-Robin.
+- Periodic cron tasks (`analyticsFlusher` and `cleanupWorker`) run exclusively on the Primary process to avoid duplicate executions.
+- Implemented Section 7.1 hybrid link expiration: dynamic Redis TTL matching remaining link lifetime, passive `410 Gone` eviction, and active background database purges.
+
+### 9.2 High-Concurrency Read Benchmark (`npx autocannon -c 200 -d 10 -p 10`)
+
+- **Connections:** 200 concurrent connections, 10 pipelined requests.
+- **Observed Average Throughput:** **39,620 req/sec** (Peak second: **44,639 req/sec**).
+- **Observed Median Latency ($p50$):** **41 ms**.
+- **Total Redirects Handled:** 398,000 requests in 10.19 seconds.
+
+### 9.3 Final Architectural Scorecard
+
+| Milestone             | Architecture State                                  | Read Throughput          | Median Latency ($p50$) | Max Latency      | Target Status               |
+| :-------------------- | :-------------------------------------------------- | :----------------------- | :----------------------- | :--------------- | :-------------------------- |
+| **Milestone 1** | Naive Monolith (Postgres writes inline)             | 1,588 req/sec            | 531 ms                   | 4,388 ms         | Failed (Row locks)          |
+| **Milestone 2** | Redis Cache-Aside + Buffered Clicks (1 Core)        | 16,344 req/sec           | 56 ms                    | 250 ms           | Met average SLA             |
+| **Milestone 3** | **Multi-Core Cluster + Redis + Auto Cleanup** | **39,620 req/sec** | **41 ms**          | **375 ms** | **Exceeded Peak SLA** |
