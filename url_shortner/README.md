@@ -1,4 +1,3 @@
-
 # URL Shortener: Problem Statement, Capacity Estimations & System Architecture
 
 ## 1. Executive Summary & Objective
@@ -169,7 +168,6 @@ When updates run synchronously during redirection:
 
 ```sql
 UPDATE urls SET clicks = clicks + 1 WHERE short_code = 'xyz';
-
 ```
 
 Every concurrent request for the same link waits on an exclusive row write lock. Relational ACID serialization transforms concurrent reads into a blocking write queue.
@@ -230,7 +228,6 @@ If caching is only applied during reads (pure Cache-Aside), every freshly create
                                |                                    |
                                +------------------------------------+
                                    Buffered Click Counter Flush
-
 ```
 
 ### 5.1 Write Path Optimizations
@@ -259,7 +256,6 @@ To evaluate the naive implementation and capture real-world bottlenecks, we exec
 
 ```bash
 npx autocannon -c 100 -d 10 -p 10 http://localhost:9090/nodejs-about
-
 ```
 
 ---
@@ -290,7 +286,6 @@ In the initial naive implementation, every redirect executed two back-to-back da
 Req/Bytes counts sampled once per second. # of samples: 10
 0 2xx responses, 15,879 non-2xx responses (HTTP 302 Redirects)
 17k requests in 10.05s, 4.56 MB read
-
 ```
 
 #### Diagnostic Query (PostgreSQL Internal Lock Activity):
@@ -361,7 +356,6 @@ To verify row locking as the primary bottleneck, `prisma.url.update(...)` was co
 Req/Bytes counts sampled once per second. # of samples: 10
 0 2xx responses, 19,785 non-2xx responses (HTTP 302 Redirects)
 21k requests in 10.04s, 5.68 MB read
-
 ```
 
 #### Experiment 2 Findings:
@@ -404,3 +398,37 @@ To address both bottlenecks and push throughput toward the **11,500+ req/sec** t
 * Periodically sync in-memory click counts to PostgreSQL in batches every 10 seconds.
 
 5. **Run Benchmark Verification:** Measure latency and throughput under identical 100-connection load.
+
+
+
+---
+## 8. Milestone 2: Dual Read-Write Optimization & Concurrency Benchmarks
+
+### 8.1 Architectural Enhancements Implemented
+1. **Atomic Sequence Generation:** Replaced speculative Base62 generation and database lookup loops with an atomic Redis counter (`INCR global_url_counter`), mapped directly to Base62 strings.
+2. **Proactive Cache Warming:** Upon link creation, the URL mapping is immediately written to Redis with a 24-hour TTL (`SETEX link:{code} 86400 {long_url}`), eliminating cold-start database queries on initial redirect.
+3. **Cache-Aside Redirection:** Read traffic resolves strictly against Redis memory. Cache misses fall back to PostgreSQL and backfill the cache.
+4. **Decoupled Asynchronous Analytics:** Redirects increment an in-memory counter (`INCR clicks:{code}`). A background worker flushes batched metrics to PostgreSQL every 10 seconds via non-blocking `SCAN` and `GETDEL`.
+---
+### 8.2 Pure Write Benchmark (`POST /shorten`)
+
+- **Load Profile:** 50 concurrent connections over 10 seconds.
+- **Observed Average Throughput:** **3,174.4 writes/sec** (Target: 350 writes/sec).
+- **Observed Median Latency ($p50$):** **14 ms**.
+- **Total Writes Processed:** 32,000 records in 10.04s.
+
+---
+
+### 8.3 Mixed Workload Benchmark (Concurrent Reads & Writes)
+
+- **Load Profile:** 10 concurrent write connections competing against 100 concurrent pipelined read connections over 15 seconds.
+- **Read Throughput Under Write Load:** **16,438.94 req/sec** (Target: 11,574 req/sec).
+- **Read Median Latency ($p50$):** **55 ms**.
+- **Total Redirects Handled:** 248,000 requests in 15.05s.
+- **Total Writes Handled:** 4,000 requests in 15.03s.
+
+---
+
+### 8.4 Engineering Takeaway
+
+Decoupling the read and write paths using memory caching and asynchronous buffer flushes isolated CPU and I/O domains. Database disk writes no longer produce row-lock contention on active redirects, allowing both paths to exceed the project's capacity requirements on single-host hardware.
