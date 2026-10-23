@@ -9,13 +9,25 @@ const PORT = process.env.PORT || 3000;
 // Middleware for parsing JSON request bodies
 app.use(express.json());
 
-// Mount URL Shortener routes
-app.use('/', urlRoutes);
-
-// Health check endpoint
+// 1. Health check & system endpoints MUST go BEFORE wildcard /:short_code
 app.get('/health', (req, res) => {
     res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
 });
+
+app.get('/', (req, res) => {
+    res.status(200).json({
+        message: 'Welcome to the URL Shortener API',
+        endpoints: {
+            health: 'GET /health',
+            shorten: 'POST /shorten',
+            redirect: 'GET /:short_code',
+            analytics: 'GET /analytics/:short_code',
+        },
+    });
+});
+
+// 2. Mount URL Shortener routes (which contains the wildcard /:short_code)
+app.use('/', urlRoutes);
 
 // Centralized error-handling middleware
 app.use((err, req, res, next) => {
