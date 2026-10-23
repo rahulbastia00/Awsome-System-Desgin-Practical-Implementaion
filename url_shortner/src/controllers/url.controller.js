@@ -1,6 +1,6 @@
 const prisma = require('../config/db');
 const redis = require('../config/redis');
-const { isValidUrl } = require('../utils/validator');
+const { isValidUrl, validateCustomAlias } = require('../utils/validator');
 const { getNextShortCode } = require('../utils/base62');
 
 const DEFAULT_CACHE_TTL_SECONDS = 86400; // 24 hours
@@ -28,19 +28,20 @@ function calculateCacheTtl(expiresAt) {
 
 /**
  * POST /shorten
- * Shortens a long URL with optional custom alias, atomic ID generation, and Redis cache warming
+ * Shortens a long URL with custom alias safeguards, atomic collision defense, and Redis cache warming
  */
 async function shortenUrl(req, res, next) {
   try {
     const { long_url, custom_alias, expires_at, user_id } = req.body;
 
-    // 1. Validation
+    // 1. URL Validation
     if (!long_url || !isValidUrl(long_url)) {
       return res.status(400).json({
         error: 'Invalid URL. Please provide a well-formed HTTP or HTTPS URL.',
       });
     }
 
+    // 2. Expiration Validation
     let parsedExpiresAt = null;
     if (expires_at) {
       parsedExpiresAt = new Date(expires_at);
@@ -51,34 +52,42 @@ async function shortenUrl(req, res, next) {
       }
     }
 
-    let shortCode = custom_alias ? custom_alias.trim() : null;
+    let shortCode = null;
 
-    // 2. Custom Alias Handling
-    if (shortCode) {
-      // Check if alias already exists
-      const existing = await prisma.url.findUnique({
-        where: { shortCode },
+    // 3. Custom Alias Handling & Pre-Database Guard Clauses
+    if (custom_alias) {
+      const aliasValidation = validateCustomAlias(custom_alias);
+      if (!aliasValidation.valid) {
+        return res.status(400).json({
+          error: aliasValidation.error,
+        });
+      }
+      shortCode = custom_alias.trim();
+    } else {
+      // Collision-free Base62 code generated via Redis atomic counter
+      shortCode = await getNextShortCode(redis);
+    }
+
+    // 4. Atomic Insert & Unique Constraint Defense (Handles race condition at the DB layer)
+    let newRecord;
+    try {
+      newRecord = await prisma.url.create({
+        data: {
+          shortCode,
+          longUrl: long_url,
+          userId: user_id || null,
+          expiresAt: parsedExpiresAt,
+        },
       });
-
-      if (existing) {
+    } catch (dbError) {
+      // Prisma error P2002 represents Unique Constraint Violation
+      if (dbError.code === 'P2002') {
         return res.status(409).json({
           error: `The alias '${shortCode}' is already taken. Please choose another.`,
         });
       }
-    } else {
-      // 3. Collision-free Base62 code generated via Redis atomic counter
-      shortCode = await getNextShortCode(redis);
+      throw dbError;
     }
-
-    // 4. Persist to PostgreSQL via Prisma ORM
-    const newRecord = await prisma.url.create({
-      data: {
-        shortCode,
-        longUrl: long_url,
-        userId: user_id || null,
-        expiresAt: parsedExpiresAt,
-      },
-    });
 
     // 5. Cache Warming with Expiration-Aware TTL (Cache Consistency)
     const cacheTtl = calculateCacheTtl(parsedExpiresAt);
@@ -86,7 +95,7 @@ async function shortenUrl(req, res, next) {
       await redis.setex(`link:${shortCode}`, cacheTtl, long_url);
     }
 
-    const baseUrl = process.env.BASE_URL || `http://localhost:${process.env.PORT || 3000}`;
+    const baseUrl = process.env.BASE_URL || `http://localhost:${process.env.PORT || 9090}`;
 
     return res.status(201).json({
       short_url: `${baseUrl}/${newRecord.shortCode}`,

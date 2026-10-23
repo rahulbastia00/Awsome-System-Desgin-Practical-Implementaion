@@ -1,54 +1,48 @@
-# URL Shortener: Problem Statement, Capacity Estimations & System Architecture
 
-## 1. Executive Summary & Objective
-
-A **URL Shortener** is a service that translates long, verbose URLs (often containing tracking parameters, nested path identifiers, and query strings) into concise, unique alphanumeric aliases (e.g., `[https://algo.ms/7xK9q2](https://algo.ms/7xK9q2)`). When a client queries this alias, the system must translate the short identifier back to the long URL and issue an HTTP redirect.
-
-While conceptually simple at low traffic, building this for production is an industry-standard test for distributed systems design due to:
-
-* Extreme read/write asymmetry ($\approx 100:1$).
-* Strict low-latency SLAs ($p99 < 50\text{ ms}$).
-* Massive cumulative storage and key-space sizing over time.
-* High concurrency locking and collision hazards.
+# URL Shortener: Complete System Design, Empirical Scaling & Performance Engineering Case Study
 
 ---
 
-## 2. Requirements Specification
+## 1. Executive Summary & Problem Statement
 
-### 2.1 Functional Requirements (FR)
+### 1.1 What is a URL Shortener?
 
-1. **Shorten URL:** Accept a target long URL and output a uniquely generated, compact short URL.
-2. **Redirection:** When accessing `GET /{short_code}`, redirect the client to the canonical destination with an HTTP `302 Found` (or `301 Moved Permanently`).
-3. **Custom Aliases:** Allow users to submit an optional vanity alias (e.g., `/black-friday-sale`) subject to uniqueness constraints.
-4. **Link Expiration:** Support an optional expiration timestamp (`expires_at`). Expired links must not redirect and should return `410 Gone`.
-5. **Basic Analytics:** Record the aggregate click counter per link without impacting redirect performance.
+A **URL Shortener** is an Internet service that accepts a long, unwieldy destination URL (often saturated with affiliate tags, deep nested routing, and tracking query parameters) and converts it into a short, uniform alphanumeric key (e.g., `http://localhost:9090/mdn-docs_2026`).
 
-### 2.2 Non-Functional Requirements (NFR)
+When an end user accesses the short link, the service:
 
-1. **High Availability ($99.99\%$):** The redirect path must stay operational even during database failovers or network partitions.
-2. **Ultra-Low Latency:** Redirect resolution must be served within $< 50\text{ ms}$ at the 99th percentile ($p99$), and $< 15\text{ ms}$ on median cache hits.
-3. **Collision Resistance & Uniqueness:** No two distinct target URLs may map to the same short code unless intentionally deduplicated; custom aliases must be atomic.
-4. **Durability:** Once confirmed, a mapping must never be lost or silently corrupted.
+1. Resolves the short identifier to its canonical target URL.
+2. Emits an HTTP `302 Found` redirection header to direct the client browser.
+3. Records analytics (click counts and access timestamps) for link owners.
+
+### 1.2 The Engineering Challenge
+
+While trivial to build for small personal projects, designing a production-grade URL shortener is an industry benchmark for distributed systems engineering due to four fundamental challenges:
+
+1. **Extreme Read/Write Asymmetry ($\approx 100:1$):** Once created, a link is clicked hundreds or thousands of times. Read operations vastly outnumber write operations.
+2. **Strict Latency SLAs:** Redirection must be imperceptible to users. Target: Median latency ($p50$) $< 15\text{ ms}$, 99th percentile ($p99$) $< 50\text{ ms}$.
+3. **Database Concurrency & Row Locking:** Updating a click counter in a relational database for every redirect forces exclusive row locks, serializing traffic and freezing the service.
+4. **Hardware Saturation:** Standard Node.js applications execute on a single thread. Without process clustering, multi-core hardware sits idle while a single core chokes on network I/O.
 
 ---
 
-## 3. Back-of-the-Envelope Calculations (Scale & Resource Profiling)
+## 2. Quantitative System Scale & Resource Estimations
 
-To design the database and server capacity realistically, we establish engineering numbers based on industry scale assumptions.
+All design choices are rooted in concrete capacity requirements calculated using back-of-the-envelope estimations.
 
-### 3.1 Traffic & Throughput Estimations
+### 2.1 Traffic & Throughput Capacity
 
-* **New URLs Created (Writes):** $10\text{ million}$ links/day.
-* **Read-to-Write Ratio:** $100 : 1$.
-* **Redirect Requests (Reads):** $10\text{ million} \times 100 = 1\text{ billion}$ clicks/day.
+- **New URLs Created (Writes):** $10\text{ million}$ new links per day.
+- **Read-to-Write Ratio:** $100 : 1$.
+- **Redirect Invocations (Reads):** $10\text{ million} \times 100 = 1\text{ billion}$ clicks per day.
 
 #### Write Throughput (QPS - Queries Per Second)
 
 $$
-\text{Average Write QPS} = \frac{10{,}000{,}000\text{ requests}}{24 \times 3600\text{ seconds}} \approx \frac{10{,}000{,}000}{86{,}400} \approx 116\text{ writes/sec}
+\text{Average Write QPS} = \frac{10{,}000{,}000\text{ writes}}{24 \times 3600\text{ seconds}} \approx 116\text{ writes/sec}
 $$
 
-Accounting for peak traffic surges ($3\times$ factor):
+Accounting for a $3\times$ peak traffic surge:
 
 $$
 \text{Peak Write QPS} = 116 \times 3 \approx 350\text{ writes/sec}
@@ -57,10 +51,10 @@ $$
 #### Read Throughput (Redirect QPS)
 
 $$
-\text{Average Read QPS} = \frac{1{,}000{,}000{,}000\text{ requests}}{86{,}400\text{ seconds}} \approx 11{,}574\text{ reads/sec}
+\text{Average Read QPS} = \frac{1{,}000{,}000{,}000\text{ reads}}{86{,}400\text{ seconds}} \approx 11{,}574\text{ reads/sec}
 $$
 
-Accounting for peak traffic surges ($3\times$ factor):
+Accounting for a $3\times$ peak traffic surge:
 
 $$
 \text{Peak Read QPS} = 11{,}574 \times 3 \approx 34{,}720 \approx 35{,}000\text{ reads/sec}
@@ -68,396 +62,467 @@ $$
 
 ---
 
-### 3.2 Storage Capacity Estimations
+### 2.2 Storage & Memory Calculations
 
-Payload size estimate per entry:
+#### Record Payload Size
 
-* `short_code`: 7 bytes (ASCII characters)
-* `long_url`: 200 bytes (average web URL length)
-* `user_id`: 36 bytes (UUID v4)
-* `created_at`: 8 bytes (timestamp integer)
-* `expires_at`: 8 bytes (timestamp integer)
-* `click_count`: 8 bytes (64-bit counter)
-* Database index and metadata overhead: $\approx 33\text{ bytes}$
-* **Total row size:** $\approx 300\text{ bytes}$ per record.
+- `short_code`: 7 bytes (ASCII characters)
+- `long_url`: 200 bytes (average HTTP/HTTPS URL length)
+- `user_id`: 36 bytes (UUID v4 string)
+- `created_at`: 8 bytes (timestamp integer)
+- `expires_at`: 8 bytes (nullable timestamp integer)
+- `click_count`: 8 bytes (64-bit integer counter)
+- Index & DBMS B-Tree overhead: $\approx 33\text{ bytes}$
+- **Total Record Footprint:** $\approx 300\text{ bytes}$ per row.
 
-#### Storage Accumulation
-
-* **URLs generated per year:**
+#### 5-Year Storage Accumulation
 
 $$
-10{,}000{,}000 \times 365 = 3.65\text{ billion URLs/year}
+\text{New Records/Year} = 10{,}000{,}000 \times 365 = 3.65\text{ billion rows/year}
 $$
 
-* **Annual Storage Footprint:**
-
 $$
-3.65 \times 10^9 \text{ records} \times 300\text{ bytes} \approx 1{,}095{,}000{,}000{,}000\text{ bytes} \approx 1.1\text{ TB/year}
+\text{Annual Storage} = 3.65 \times 10^9 \times 300\text{ bytes} \approx 1.1\text{ TB/year}
 $$
 
-* **5-Year Cumulative Capacity:**
-
 $$
-1.1\text{ TB} \times 5 = 5.5\text{ TB}
+\text{5-Year Storage} = 1.1\text{ TB} \times 5 = 5.5\text{ TB}
 $$
 
-> **Laptop Constraint Model:** Stress-testing local hardware (16 GB RAM, 1 TB storage) focuses on matching the **rate** ($\text{requests/sec}$) rather than holding multi-terabyte datasets. A dataset of $100{,}000$ to $1{,}000{,}000$ rows stresses I/O, connection pools, and CPU caches on local hardware.
+#### In-Memory Cache Sizing (Pareto 80/20 Distribution)
+
+In web traffic, $20\%$ of links generate $80\%$ of redirect volume.
+
+- **Daily Active Links:** $200\text{ million}$ links.
+- **RAM Required to Cache Daily Hot Links:**
+
+$$
+200{,}000{,}000 \times 300\text{ bytes} \approx 60\text{ GB RAM}
+$$
+
+*Local Constraint:* On our 16 GB laptop, we cap Redis memory to $256\text{ MB} - 512\text{ MB}$, enabling us to validate throughput, cache hits, and cache eviction policies under full load.
 
 ---
 
-### 3.3 Memory & Cache Estimation (Pareto 80/20 Rule)
+### 2.3 Mathematical Key-Space Sizing (Why Base62?)
 
-In URL shortener traffic, $20\%$ of hot links generate $80\%$ of redirect volume.
-
-* **Daily Redirects:** $1\text{ billion}$
-* **20% Hot Links Volume:** $200\text{ million}$ unique URLs active per day.
-* **Memory required to cache 20% of daily active links:**
+Base62 utilizes digits (`0-9`), lowercase letters (`a-z`), and uppercase letters (`A-Z`):
 
 $$
-200{,}000{,}000 \times 300\text{ bytes} = 60\text{ GB RAM}
+\text{Character Pool} = 10 + 26 + 26 = 62\text{ characters}
 $$
 
-For our local testing on a 16 GB machine, we allocate $256\text{ MB} - 512\text{ MB}$ to Redis, sufficient to cache hot links and test eviction policies (LRU) under load.
+We avoid Base64 because it includes `+` and `/`, which are reserved delimiters in HTTP URLs that require percent-encoding (`%2B`, `%2F`), causing browser routing bugs.
+
+#### Capacity by Short Code Length:
+
+- **Length 6:** $62^6 = 56{,}800{,}235{,}584$ ($\approx 56.8\text{ billion}$ codes, exhausted in $\approx 15$ years).
+- **Length 7:** $62^7 = 3{,}521{,}614{,}606{,}208$ ($\approx 3.52\text{ trillion}$ codes, provides $\approx 960$ years of headroom).
+
+**Conclusion:** A **7-character Base62 string** guarantees virtually infinite scale with zero byte waste.
 
 ---
 
-### 3.4 Key-Space Capacity: Why Base62?
+## 3. End-State Architecture Diagram
 
-We use Base62 encoding:
+The finalized architecture distributes load across multi-core worker processes, isolates reads into in-memory cache, and decouples analytics writes into asynchronous buffers.
 
-* Digits: `0-9` (10 characters)
-* Lowercase: `a-z` (26 characters)
-* Uppercase: `A-Z` (26 characters)
-* **Total pool:** $10 + 26 + 26 = 62\text{ characters}$.
+```mermaid
+flowchart TD
+    subgraph Clients["Clients & Stress Test Tooling"]
+        C1["autocannon (100-200 concurrent connections)"]
+        C2["Web Browsers & API Consumers"]
+    end
 
-Base62 avoids the `+` and `/` characters of Base64, which require URL encoding in web browsers.
+    subgraph Host["Local Node.js Host (12 Logical CPU Cores, Port 9090)"]
+        LB["Primary Master Process (node:cluster Load Balancer)"]
+      
+        subgraph Workers["Stateless Express Worker Pool (Round-Robin)"]
+            W1["Worker 1 (PID: 11822)"]
+            W2["Worker 2 (PID: 11823)"]
+            W3["Worker 3 (PID: 11824)"]
+            W4["Worker 4 (PID: 11825)"]
+        end
 
-#### Key Length Calculations:
+        subgraph BackgroundWorkers["Master Isolated Cron Workers"]
+            AF["Analytics Flusher (Every 10s)"]
+            CW["Expired Links Cleanup Worker (Every 60s)"]
+        end
+    end
 
-* With length $n = 6$:
+    subgraph MemoryTier["In-Memory Tier (Docker: url-redis, Port 6379)"]
+        R_Cache[("Key-Value Cache<br/>link:{short_code} -> long_url")]
+        R_Counter[("Global Counter<br/>INCR global_url_counter")]
+        R_Buffer[("Click Analytics Buffer<br/>INCR clicks:{short_code}")]
+    end
 
-$$
-62^6 = 56{,}800{,}235{,}584 \approx 56.8\text{ billion unique URLs}
-$$
+    subgraph DiskTier["Persistent Storage (Docker: url-shortner-db, Port 5432)"]
+        PG[("PostgreSQL 16 Engine<br/>Table: urls (B-Tree Indexes)")]
+    end
 
-*(Exhausted in $\approx 15$ years at 10M writes/day)*
+    %% Client Routing
+    C1 -->|HTTP Traffic| LB
+    C2 -->|HTTP Traffic| LB
+    LB -->|TCP Socket Round-Robin| W1
+    LB -->|TCP Socket Round-Robin| W2
+    LB -->|TCP Socket Round-Robin| W3
+    LB -->|TCP Socket Round-Robin| W4
 
-* With length $n = 7$:
+    %% Write Path (POST /shorten)
+    W1 -.->|"1. INCR counter (O(1))"| R_Counter
+    W1 -.->|"2. Base62 Encode & INSERT"| PG
+    W1 -.->|"3. Proactive Cache Warming"| R_Cache
 
-$$
-62^7 = 3{,}521{,}614{,}606{,}208 \approx 3.52\text{ trillion unique URLs}
-$$
+    %% Read Path (GET /:short_code)
+    W2 -->|"1. GET link:{short_code} (<1ms)"| R_Cache
+    R_Cache -- Cache Miss Fallback --> PG
+    W2 -->|"2. Fire-and-Forget INCR"| R_Buffer
+    W2 -->|"3. HTTP 302 Found Redirect"| C2
 
-*(Exhausted in $\approx 960$ years at 10M writes/day)*
-
-A **7-character Base62 string** gives long-term headroom with zero byte waste.
-
----
-
-## 4. Why Naive Systems Collapse Under Load
-
-When built naively in Node.js (e.g., Express + direct ORM/PostgreSQL queries without caching or concurrency decoupling), the system crashes under moderate traffic spikes:
-
-### 1. Database Connection & Disk I/O Saturation
-
-At high QPS, querying a database directly forces disk index traversals. Database connection pools (e.g., default pool size of 10) are quickly exhausted, leading to request queue stalls and connection drops.
-
-### 2. Row-Lock Contention on Click Counters
-
-When updates run synchronously during redirection:
-
-```sql
-UPDATE urls SET clicks = clicks + 1 WHERE short_code = 'xyz';
+    %% Background Workers
+    AF -->|"Non-blocking SCAN & GETDEL"| R_Buffer
+    AF -->|"Batch UPDATE clicks + N"| PG
+    CW -->|"DELETE WHERE expires_at < NOW()"| PG
+    CW -->|"Purge Stale Keys"| R_Cache
 ```
 
-Every concurrent request for the same link waits on an exclusive row write lock. Relational ACID serialization transforms concurrent reads into a blocking write queue.
+---
 
-### 3. Write Bottleneck: The "Check-Then-Act" Anti-Pattern
+## 4. The Step-by-Step Evolutionary Journey
 
-Under naive implementations, the write path checks existence prior to insertion:
+We built, benchmarked, broke, and optimized the system through four distinct engineering milestones.
 
-```javascript
-while (attempts < MAX_ATTEMPTS) {
-  const candidate = generateShortCode(7);
-  const exists = await prisma.url.findUnique({ where: { shortCode: candidate } });
-  if (!exists) { break; }
-}
-await prisma.url.create({ ... });
-
+```mermaid
+timeline
+    title System Performance Evolution (Read Throughput)
+    Milestone 1 (Naive PostgreSQL) : 1,588 req/sec : Severe Row-Lock Contention
+    Milestone 1.5 (Isolation Test) : 1,978 req/sec : DB Disk I/O & Pool Ceiling
+    Milestone 2 (Redis Cache-Aside) : 16,344 req/sec : Memory Tier Unlocked
+    Milestone 3 (Multi-Core Cluster) : 39,620 req/sec : Exceeded 35,000 Peak Target
 ```
-
-This forces up to 5 speculative read roundtrips per write. Under heavy concurrent writes, two requests can evaluate the same code as free simultaneously, producing unique constraint collisions (`P2002`).
-
-### 4. Cache Cold-Starts on New Links
-
-If caching is only applied during reads (pure Cache-Aside), every freshly created link triggers a guaranteed database cache miss on its first access surge, routing initial traffic straight to disk.
 
 ---
 
-## 5. Architectural Strategy: Dual Read/Write Optimization
+### Milestone 1: The Naive Monolith & Database Row-Locking Failure
 
-```
-                                  +-------------------+
-                                  |      Client       |
-                                  +---------+---------+
-                                            |
-                                            v
-                            +---------------+---------------+
-                            |   Load Balancer (Reverse Proxy)|
-                            +---------------+---------------+
-                                            |
-                    +-----------------------+-----------------------+
-                    |                                               |
-         [Write Path: POST /shorten]                      [Read Path: GET /:code]
-                    |                                               |
-                    v                                               v
-        +-----------------------+                       +-----------------------+
-        | URL Generator Service |                       |  Redirection Service  |
-        +-----------+-----------+                       +-----------+-----------+
-                    |                                               |
-         +----------+----------+                                    |
-         |                     |                          (1) Check Cache First
-         v                     v                                    |
-   +-----------+         +-----------+                              v
-   | ID Engine |         | Database  | <--------------------+---------------+
-   | (Atomic   |         | (Postgres |      (2) Cache Miss  |  Redis Cache  |
-   |  Counter) |         |  Storage) |                      +---------------+
-   +-----------+         +-----+-----+                              |
-                               ^                                    |
-                               |                          (3) Async Ingest
-                               |                                    |
-                               +------------------------------------+
-                                   Buffered Click Counter Flush
-```
+#### 1. Implementation
 
-### 5.1 Write Path Optimizations
+The initial design coupled Express, Prisma ORM, and PostgreSQL. Every redirect executed two back-to-back operations:
 
-1. **Collision-Free Generation via Atomic Counters:** Replace random string guesses with an atomic Redis sequence counter (`INCR url_counter`) converted to Base62. Guarantees unique, $O(1)$ generation without database collision checks.
-2. **Proactive Cache Warming:** Immediately upon writing the new link to PostgreSQL, store it in Redis (`SET link:{short_code} {long_url}`). The very first read hits RAM instantly, eliminating cold-start database latency.
+1. `prisma.url.findUnique`: Fetch the destination URL from PostgreSQL.
+2. `prisma.url.update`: Increment the counter inline:
+   ```javascript
+   await prisma.url.update({
+     where: { shortCode: short_code },
+     data: { clicks: { increment: 1 }, lastAccessed: new Date() },
+   });
+   ```
 
-### 5.2 Read Path Optimizations
-
-1. **Cache-Aside Resolution:** Lookups check Redis first ($< 1\text{ ms}$). Only cache misses trigger a PostgreSQL read.
-2. **Decoupled Analytics via Buffered Counting:** Remove all database updates from the redirect loop. Atomically increment an in-memory counter (`INCR link:{short_code}:clicks`) in Redis and return the redirect immediately.
-3. **Background Batch Flusher:** A periodic worker reads Redis click counters every 10 seconds and flushes updates to PostgreSQL in a single batch query.
-
----
-
-## 6. Baseline Implementation & Empirical Load Testing
-
-To evaluate the naive implementation and capture real-world bottlenecks, we executed load tests against the initial Express + Prisma + PostgreSQL code on local hardware (16 GB RAM).
-
-### 6.1 Test Setup & Tooling
-
-* **Benchmarking Tool:** `autocannon`
-* **Target Endpoint:** `GET http://localhost:9090/nodejs-about` (HTTP `302 Found` redirect)
-* **Concurrency Parameters:** 100 concurrent connections (`-c 100`), 10-second run duration (`-d 10`), pipelining factor of 10 (`-p 10`).
-* **Load Command:**
+#### 2. Load Testing Execution
 
 ```bash
 npx autocannon -c 100 -d 10 -p 10 http://localhost:9090/nodejs-about
 ```
 
----
-
-### 6.2 Experiment 1: Baseline Architecture (Read + Inline Atomic Write)
-
-In the initial naive implementation, every redirect executed two back-to-back database queries:
-
-1. `prisma.url.findUnique(...)` to fetch the destination URL.
-2. `prisma.url.update(...)` to execute an inline atomic click counter increment (`clicks: { increment: 1 }`).
-
-#### Autocannon Results:
+#### 3. Empirical Observations
 
 ```text
-┌─────────┬───────┬────────┬─────────┬─────────┬───────────┬───────────┬─────────┐
-│ Stat    │ 2.5%  │ 50%    │ 97.5%   │ 99%     │ Avg       │ Stdev     │ Max     │
-├─────────┼───────┼────────┼─────────┼─────────┼───────────┼───────────┼─────────┤
-│ Latency │ 90 ms │ 531 ms │ 1304 ms │ 1367 ms │ 607.49 ms │ 309.35 ms │ 4388 ms │
-└─────────┴───────┴────────┴─────────┴─────────┴───────────┴───────────┴─────────┘
-┌───────────┬─────────┬─────────┬────────┬────────┬─────────┬────────┬─────────┐
-│ Stat      │ 1%      │ 2.5%    │ 50%    │ 97.5%  │ Avg     │ Stdev  │ Min     │
-├───────────┼─────────┼─────────┼────────┼────────┼─────────┼────────┼─────────┤
-│ Req/Sec   │ 39      │ 39      │ 1,714  │ 2,149  │ 1,588.1 │ 645.95 │ 39      │
-├───────────┼─────────┼─────────┼────────┼────────┼─────────┼────────┼─────────┤
-│ Bytes/Sec │ 11.2 kB │ 11.2 kB │ 492 kB │ 617 kB │ 456 kB  │ 185 kB │ 11.2 kB │
-└───────────┴─────────┴─────────┴────────┴────────┴─────────┴────────┴─────────┘
-
-Req/Bytes counts sampled once per second. # of samples: 10
-0 2xx responses, 15,879 non-2xx responses (HTTP 302 Redirects)
-17k requests in 10.05s, 4.56 MB read
+Latency: 50% = 531 ms | 99% = 1,367 ms | Avg = 607.49 ms | Max = 4,388 ms
+Req/Sec: Avg = 1,588.1 req/sec | Min = 39 req/sec
+Total:   17k requests in 10.05s
 ```
 
-#### Diagnostic Query (PostgreSQL Internal Lock Activity):
+#### 4. The Root Cause Investigation (`pg_stat_activity`)
 
-Active database sessions were queried during peak execution:
+Running diagnostic SQL queries on PostgreSQL during peak load revealed the exact failure mode:
 
 ```sql
 SELECT pid, wait_event_type, wait_event, state, query 
 FROM pg_stat_activity 
 WHERE state != 'idle' AND query LIKE '%urls%';
-
 ```
-
-#### Database Lock Inspection Output:
 
 ```text
  pid | wait_event_type |  wait_event   | state  | query
 -----+-----------------+---------------+--------+-------------------------------------------------------------
   67 | LWLock          | LockManager   | active | UPDATE "public"."urls" SET "clicks" = ("public"."urls"...
   74 | Lock            | tuple         | active | UPDATE "public"."urls" SET "clicks" = ("public"."urls"...
-  71 | null            | null          | active | UPDATE "public"."urls" SET "clicks" = ("public"."urls"...
-  73 | Lock            | tuple         | active | UPDATE "public"."urls" SET "clicks" = ("public"."urls"...
-  76 | null            | null          | active | UPDATE "public"."urls" SET "clicks" = ("public"."urls"...
   70 | Lock            | transactionid | active | UPDATE "public"."urls" SET "clicks" = ("public"."urls"...
-  72 | Lock            | tuple         | active | UPDATE "public"."urls" SET "clicks" = ("public"."urls"...
-  68 | Lock            | tuple         | active | UPDATE "public"."urls" SET "clicks" = ("public"."urls"...
-  75 | null            | null          | active | UPDATE "public"."urls" SET "clicks" = ("public"."urls"...
-  69 | Lock            | tuple         | active | UPDATE "public"."urls" SET "clicks" = ("public"."urls"...
-  77 | null            | null          | active | UPDATE "public"."urls" SET "clicks" = ("public"."urls"...
-  78 | Lock            | transactionid | active | UPDATE "public"."urls" SET "clicks" = ("public"."urls"...
-  83 | Lock            | tuple         | active | UPDATE "public"."urls" SET "clicks" = ("public"."urls"...
-  82 | Lock            | tuple         | active | UPDATE "public"."urls" SET "clicks" = ("public"."urls"...
-  81 | null            | null          | active | UPDATE "public"."urls" SET "clicks" = ("public"."urls"...
-  79 | Lock            | tuple         | active | UPDATE "public"."urls" SET "clicks" = ("public"."urls"...
-  96 | null            | null          | active | SELECT pid, wait_event_type, wait_event, state, query...
-
 ```
 
-#### Experiment 1 Findings:
+#### 5. Engineering Diagnosis
 
-* **Lock Contention:** PostgreSQL processes stalled on `wait_event_type = Lock` (`tuple` and `transactionid`) and `LWLock` (`LockManager`). All 100 concurrent workers competed for the same physical row lock on disk.
-* **Latency Spikes:** Median latency reached **531 ms**, with a peak tail latency of **4,388 ms** (4.4 seconds).
-* **Stalling Throughput:** Minimum throughput dropped to **39 req/sec**, showing near-total lock stalls during high concurrency.
-* **Total Throughput:** Capped at an average of **1,588.1 req/sec**.
+- **`tuple` Locks:** In PostgreSQL, a "tuple" is a physical row version on disk. Because all 100 concurrent workers requested the same URL, all 100 attempted to execute an exclusive row write lock on the exact same row simultaneously.
+- **`transactionid` & `LWLock`:** Workers froze in a serialized line waiting for the active transaction to commit to disk.
+- **The Finding:** An inline click counter transforms a high-speed read endpoint into a serialized disk-write queue.
 
 ---
 
-### 6.3 Experiment 2: Isolation Test (Write Step Commented Out)
+### Milestone 1.5: The Isolation Test (Proving the Hypothesis)
 
-To verify row locking as the primary bottleneck, `prisma.url.update(...)` was commented out in `redirectUrl`, leaving pure database reads.
+#### 1. Implementation
 
-#### Autocannon Results:
+We commented out `prisma.url.update(...)`, isolating pure database read performance.
+
+#### 2. Empirical Observations
 
 ```text
-┌─────────┬────────┬────────┬─────────┬─────────┬───────────┬───────────┬─────────┐
-│ Stat    │ 2.5%   │ 50%    │ 97.5%   │ 99%     │ Avg       │ Stdev     │ Max     │
-├─────────┼────────┼────────┼─────────┼─────────┼───────────┼───────────┼─────────┤
-│ Latency │ 221 ms │ 347 ms │ 1389 ms │ 6225 ms │ 483.06 ms │ 872.49 ms │ 9885 ms │
-└─────────┴────────┴────────┴─────────┴─────────┴───────────┴───────────┴─────────┘
-┌───────────┬────────┬────────┬────────┬────────┬─────────┬────────┬────────┐
-│ Stat      │ 1%     │ 2.5%   │ 50%    │ 97.5%  │ Avg     │ Stdev  │ Min    │
-├───────────┼────────┼────────┼────────┼────────┼─────────┼────────┼────────┤
-│ Req/Sec   │ 1,279  │ 1,279  │ 1,974  │ 2,431  │ 1,978.7 │ 375.02 │ 1,279  │
-├───────────┼────────┼────────┼────────┼────────┼─────────┼────────┼────────┤
-│ Bytes/Sec │ 367 kB │ 367 kB │ 567 kB │ 698 kB │ 568 kB  │ 108 kB │ 367 kB │
-└───────────┴────────┴────────┴────────┴────────┴─────────┴────────┴────────┘
-
-Req/Bytes counts sampled once per second. # of samples: 10
-0 2xx responses, 19,785 non-2xx responses (HTTP 302 Redirects)
-21k requests in 10.04s, 5.68 MB read
+Latency: 50% = 347 ms | 99% = 6,225 ms | Avg = 483.06 ms | Max = 9,885 ms
+Req/Sec: Avg = 1,978.7 req/sec | Min = 1,279 req/sec
+Total:   21k requests in 10.04s
 ```
 
-#### Experiment 2 Findings:
+#### 3. Engineering Diagnosis
 
-* **Lock Elimination:** Minimum throughput stabilized at **1,279 req/sec** (up from 39 req/sec), eliminating complete thread freezes.
-* **Average Throughput:** Rose 25% to **1,978.7 req/sec**.
-* **Secondary Bottleneck Isolated:** Median latency remained high at **347 ms** and peak latency reached **9,885 ms**. Database query roundtrips, connection pool constraints, and ORM query serialization capped throughput under 2,000 req/sec.
-
----
-
-### 6.4 Comparative Summary
-
-| Metric                         | Target SLA                      | Baseline (Read + Write)         | Read-Only Isolation                |
-| ------------------------------ | ------------------------------- | ------------------------------- | ---------------------------------- |
-| **Throughput (Avg)**     | $\ge 11{,}500\text{ req/sec}$ | 1,588.1 req/sec                 | 1,978.7 req/sec                    |
-| **Throughput (Min)**     | Stable                          | 39 req/sec (freeze)             | 1,279 req/sec                      |
-| **Median Latency (p50)** | $< 15\text{ ms}$              | 531 ms                          | 347 ms                             |
-| **Peak Latency (Max)**   | $< 50\text{ ms}$              | 4,388 ms                        | 9,885 ms                           |
-| **Primary Bottleneck**   | N/A                             | Row-Lock Contention (`tuple`) | DB Disk I/O & Prisma Pool Overhead |
+- **The Gain:** Minimum throughput surged from **39 req/sec to 1,279 req/sec**. Eliminating the row lock prevented server stalls.
+- **The New Bottleneck:** Even without writes, throughput capped at **~1,978 req/sec** and median latency was **347 ms**. The overhead of relational query parsing, connection pool limits, and disk reads prevented PostgreSQL from ever reaching the 11,500+ req/sec SLA.
 
 ---
 
-## 7. Next Implementation Steps: Simultaneous Dual-Path Optimization
+### Milestone 2: Dual Read-Write Optimization (Redis Integration)
 
-To address both bottlenecks and push throughput toward the **11,500+ req/sec** target, we will deploy the following updates:
+To solve both read saturation and write overhead simultaneously, we introduced Redis alongside PostgreSQL.
 
-1. **Deploy Redis In-Memory Engine:** Run Redis container alongside PostgreSQL on port 6379.
-2. **Optimize the Write Path (`POST /shorten`):**
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Client
+    participant Express as Express Controller
+    participant Redis as Redis (In-Memory)
+    participant Postgres as PostgreSQL (Disk)
 
-* Use an atomic Redis counter for collision-free Base62 ID generation, removing "check-then-act" database queries.
-* Proactively warm Redis on insert (`SET link:{short_code} {long_url}`) to ensure zero-latency initial reads.
+    Note over Client,Postgres: OPTIMIZED WRITE PATH (POST /shorten)
+    Client->>Express: POST /shorten { long_url }
+    Express->>Redis: INCR global_url_counter
+    Redis-->>Express: Integer ID (e.g. 10000042)
+    Express->>Express: Base62 Encode ID -> "2wY8k"
+    Express->>Postgres: INSERT INTO urls (shortCode, longUrl)
+    Express->>Redis: SETEX link:2wY8k 86400 longUrl (Cache Warming)
+    Express-->>Client: 201 Created { short_url }
 
-3. **Optimize the Read Path (`GET /:short_code`):**
+    Note over Client,Postgres: OPTIMIZED READ PATH (GET /:short_code)
+    Client->>Express: GET /2wY8k
+    Express->>Redis: GET link:2wY8k
+    alt Cache Hit (99% of requests)
+        Redis-->>Express: Target Long URL
+    else Cache Miss (1% fallback)
+        Express->>Postgres: SELECT longUrl FROM urls WHERE shortCode = '2wY8k'
+        Postgres-->>Express: Target Long URL
+        Express->>Redis: SETEX link:2wY8k 86400 longUrl
+    end
+    Express->)Redis: INCR clicks:2wY8k (Decoupled Async Buffer)
+    Express-->>Client: 302 Found (Location: destination)
+```
 
-* Direct requests to Redis via Cache-Aside, bypassing PostgreSQL for all cached records.
-* Buffer analytics via `INCR link:{short_code}:clicks` in Redis, removing row updates from the request lifecycle.
+#### 1. Architectural Changes
 
-4. **Deploy Background Batch Flusher:**
+1. **Atomic ID Generation:** Replaced random string generation loops with an atomic Redis counter (`INCR global_url_counter`), mapped directly to Base62 strings. Zero collision checks needed ($O(1)$ write time).
+2. **Proactive Cache Warming:** Upon link creation, the URL is saved to PostgreSQL and immediately written to Redis (`SETEX link:{code} 86400 {long_url}`). The initial access is a guaranteed cache hit.
+3. **Cache-Aside Reads:** Lookups resolve in Redis memory in $< 1\text{ ms}$, entirely bypassing PostgreSQL.
+4. **Decoupled Analytics Flusher:** Removed SQL writes from the redirect path. Redirects increment an in-memory counter (`INCR clicks:{code}`). A background worker scans keys and flushes batched updates to PostgreSQL every 10 seconds:
+   ```javascript
+   const count = await redis.getdel(`clicks:${shortCode}`);
+   if (count > 0) {
+     await prisma.url.update({
+       where: { shortCode },
+       data: { clicks: { increment: Number(count) }, lastAccessed: new Date() },
+     });
+   }
+   ```
 
-* Periodically sync in-memory click counts to PostgreSQL in batches every 10 seconds.
+#### 2. Empirical Benchmark Results
 
-5. **Run Benchmark Verification:** Measure latency and throughput under identical 100-connection load.
+**Pure Writes (`POST /shorten`, 50 concurrency):**
+
+```bash
+npx autocannon -c 50 -d 10 -m POST -H "Content-Type: application/json" \
+  -b '{"long_url": "https://example.com/system-design-test-link"}' http://localhost:9090/shorten
+```
+
+- **Observed Throughput:** **3,174.4 writes/sec** (Target: 350 writes/sec — **9x headroom**).
+- **Latency:** Median = **14 ms**, Avg = **15.25 ms**.
+
+**Concurrent Mixed Workload (Writes competing against Reads):**
+
+- **Terminal 1 (Concurrent Writes):** 10 connections writing continuously.
+- **Terminal 2 (Concurrent Reads):** 100 connections reading `redis-strings` simultaneously.
+
+```text
+Read Latency:    50% = 55 ms | 99% = 104 ms | Avg = 60.31 ms | Max = 1,327 ms
+Read Throughput: Avg = 16,438.94 req/sec | Min = 13,148 req/sec
+Total Handled:   248,000 redirects in 15.05s
+```
+
+- **Engineering Verdict:** Heavy writes to PostgreSQL did **not slow down reads**. Reads remained stable at **16,438 req/sec**, proving that memory caching successfully isolated the read path from database disk I/O.
 
 ---
 
-## 8. Milestone 2: Dual Read-Write Optimization & Concurrency Benchmarks
+### Milestone 3: Horizontal Clustering & Multi-Core Load Balancing
 
-### 8.1 Architectural Enhancements Implemented
+#### 1. The Bottleneck
 
-1. **Atomic Sequence Generation:** Replaced speculative Base62 generation and database lookup loops with an atomic Redis counter (`INCR global_url_counter`), mapped directly to Base62 strings.
-2. **Proactive Cache Warming:** Upon link creation, the URL mapping is immediately written to Redis with a 24-hour TTL (`SETEX link:{code} 86400 {long_url}`), eliminating cold-start database queries on initial redirect.
-3. **Cache-Aside Redirection:** Read traffic resolves strictly against Redis memory. Cache misses fall back to PostgreSQL and backfill the cache.
-4. **Decoupled Asynchronous Analytics:** Redirects increment an in-memory counter (`INCR clicks:{code}`). A background worker flushes batched metrics to PostgreSQL every 10 seconds via non-blocking `SCAN` and `GETDEL`.
+While Redis solved the storage bottleneck, Node.js remained constrained by its single-threaded architecture. On a 12-core laptop, 1 core was saturated at 100% while the remaining 11 cores sat idle.
+
+```mermaid
+graph TD
+    subgraph SingleThread["Before: Single Process"]
+        P1["Node.js Process (1 Core @ 100%)"] -->|Capped at 16.4k QPS| Net1["Network I/O"]
+    end
+
+    subgraph MultiCore["After: Clustered Architecture"]
+        Primary["Primary Load Balancer (Port 9090)"]
+        Primary -->|TCP Round-Robin| W1["Worker 1 (Core 1)"]
+        Primary -->|TCP Round-Robin| W2["Worker 2 (Core 2)"]
+        Primary -->|TCP Round-Robin| W3["Worker 3 (Core 3)"]
+        Primary -->|TCP Round-Robin| W4["Worker 4 (Core 4)"]
+        W1 --> Net2["Aggregated Network I/O (39.6k+ QPS)"]
+        W2 --> Net2
+        W3 --> Net2
+        W4 --> Net2
+    end
+```
+
+#### 2. Implementation (`node:cluster`)
+
+We refactored `src/server.js` using Node.js clustering:
+
+- **Primary Process:** Detects logical CPU cores, forks 4 dedicated worker processes, supervises process health (re-spawns dead workers), and **exclusively runs cron flusher jobs** to prevent duplicate database writes.
+- **Worker Processes:** Stateless Express servers sharing port `9090` via operating system TCP socket handoffs.
+
+#### 3. Empirical Clustered Benchmark (200 Connections, 10 Pipelined)
+
+```bash
+npx autocannon -c 200 -d 10 -p 10 http://localhost:9090/nodejs-about
+```
+
+#### 4. Observations & System Health
+
+```text
+Latency: 50% = 41 ms | 99% = 131 ms | Avg = 50.63 ms | Max = 375 ms
+Req/Sec: Avg = 39,620 req/sec | Peak = 44,639 req/sec | Min = 21,823 req/sec
+Total:   398k requests in 10.19s (116 MB read)
+```
+
+- **Target Comparison:** The system design requirement called for handling a peak worst-case load of **34,720 $\approx$ 35,000 req/sec**.
+- **Achieved:** Our multi-core implementation sustained **39,620 req/sec**, handling nearly **400,000 requests in 10 seconds** on local hardware.
 
 ---
 
-### 8.2 Pure Write Benchmark (`POST /shorten`)
+### Milestone 4: Production Safeguards & Atomic Alias Validations
 
-- **Load Profile:** 50 concurrent connections over 10 seconds.
-- **Observed Average Throughput:** **3,174.4 writes/sec** (Target: 350 writes/sec).
-- **Observed Median Latency ($p50$):** **14 ms**.
-- **Total Writes Processed:** 32,000 records in 10.04s.
+To make the service resilient against malicious inputs and race conditions (PDF Section 6.3), we implemented strict guard clauses.
+
+#### 1. Validations Implemented
+
+- **Reserved Keyword Blocklist:** Blocks path hijacking for critical routes (`health`, `shorten`, `analytics`, `api`, `admin`, `login`, `logout`, etc.).
+- **Format Constraints:** Requires alphanumeric characters, underscores, and hyphens (`^[a-zA-Z0-9_-]+$`) with a length between 3 and 50 characters.
+- **Atomic Collision Defense:** Replaced speculative "check-then-act" queries with atomic database insertions, catching Prisma unique constraint violations (`P2002`) to prevent race conditions:
+  ```javascript
+  try {
+    const newRecord = await prisma.url.create({ data: { shortCode, longUrl } });
+  } catch (error) {
+    if (error.code === 'P2002') {
+      return res.status(409).json({ error: `The alias '${shortCode}' is already taken.` });
+    }
+    throw error;
+  }
+  ```
+
+#### 2. Verification Test Suite
+
+```bash
+# 1. Invalid Characters (Spaces / Symbols)
+curl -i -X POST http://localhost:9090/shorten \
+  -H "Content-Type: application/json" \
+  -d '{"long_url": "https://example.com", "custom_alias": "cool link!"}'
+# Output: HTTP/1.1 400 Bad Request -> "Custom alias must contain only letters, numbers, hyphens (-), and underscores (_)."
+
+# 2. Length Limit Violation (< 3 chars)
+curl -i -X POST http://localhost:9090/shorten \
+  -H "Content-Type: application/json" \
+  -d '{"long_url": "https://example.com", "custom_alias": "ab"}'
+# Output: HTTP/1.1 400 Bad Request -> "Custom alias must be between 3 and 50 characters in length."
+
+# 3. Valid Custom Alias Creation
+curl -i -X POST http://localhost:9090/shorten \
+  -H "Content-Type: application/json" \
+  -d '{"long_url": "https://developer.mozilla.org", "custom_alias": "mdn-docs_2026"}'
+# Output: HTTP/1.1 201 Created -> {"short_url":"http://localhost:9090/mdn-docs_2026", ...}
+
+# 4. Atomic Duplicate Conflict Detection
+curl -i -X POST http://localhost:9090/shorten \
+  -H "Content-Type: application/json" \
+  -d '{"long_url": "https://google.com", "custom_alias": "mdn-docs_2026"}'
+# Output: HTTP/1.1 409 Conflict -> "The alias 'mdn-docs_2026' is already taken. Please choose another."
+```
 
 ---
 
-### 8.3 Mixed Workload Benchmark (Concurrent Reads & Writes)
+## 5. Comprehensive Performance Scorecard
 
-- **Load Profile:** 10 concurrent write connections competing against 100 concurrent pipelined read connections over 15 seconds.
-- **Read Throughput Under Write Load:** **16,438.94 req/sec** (Target: 11,574 req/sec).
-- **Read Median Latency ($p50$):** **55 ms**.
-- **Total Redirects Handled:** 248,000 requests in 15.05s.
-- **Total Writes Handled:** 4,000 requests in 15.03s.
+This scorecard tracks the performance impact of each architectural change across all four milestones:
 
----
-
-### 8.4 Engineering Takeaway
-
-Decoupling the read and write paths using memory caching and asynchronous buffer flushes isolated CPU and I/O domains. Database disk writes no longer produce row-lock contention on active redirects, allowing both paths to exceed the project's capacity requirements on single-host hardware.
-
+| Architecture Milestone                                                     | Bottleneck Identified                                      | Read Throughput (Req/Sec)                   | Median Latency ($p50$) | Max Latency      | Design Target Status                       |
+| :------------------------------------------------------------------------- | :--------------------------------------------------------- | :------------------------------------------ | :----------------------- | :--------------- | :----------------------------------------- |
+| **Milestone 1: Naive Monolith** (PostgreSQL Read + Inline Update)    | Database row locking (`tuple` & `transactionid` locks) | 1,588 req/sec                               | 531 ms                   | 4,388 ms         | **Failed** (Unusable under load)     |
+| **Milestone 1.5: Read Isolation** (Update removed, pure DB read)     | Connection pool starvation & disk I/O limits               | 1,978 req/sec                               | 347 ms                   | 9,885 ms         | **Failed** (83% below read SLA)      |
+| **Milestone 2: Redis Cache-Aside** (Single-core, buffered analytics) | Single-threaded Node.js event loop capacity                | 16,438 req/sec                              | 55 ms                    | 1,327 ms         | **Achieved** (+42% over average SLA) |
+| **Milestone 3: Multi-Core Cluster** (4 Workers + Redis + Cron jobs)  | None (Hardware saturation reached)                         | **39,620 req/sec** *(Peak: 44,639)* | **41 ms**          | **375 ms** | **Exceeded** (Beat 35k Peak SLA)     |
+| **Write Optimization Benchmark** (`POST /shorten`, atomic Base62)  | Check-then-act query loops eliminated                      | **3,174 writes/sec**                  | **14 ms**          | **192 ms** | **Exceeded** (9x over 350 write SLA) |
 
 ---
 
-## 9. Milestone 3: Horizontal Clustering & Multi-Core Benchmarks
+## 6. System Design Interview Revision Guide
 
-### 9.1 Multi-Process Architecture
+When discussing this URL shortener architecture in a technical interview, structure your answers around these core concepts:
 
-- Converted `src/server.js` to utilize Node.js built-in `node:cluster` module.
-- Primary process supervises 4 worker processes distributing incoming TCP connections via OS Round-Robin.
-- Periodic cron tasks (`analyticsFlusher` and `cleanupWorker`) run exclusively on the Primary process to avoid duplicate executions.
-- Implemented Section 7.1 hybrid link expiration: dynamic Redis TTL matching remaining link lifetime, passive `410 Gone` eviction, and active background database purges.
+### Q1: Why not generate a short code by hashing (MD5/SHA256) and taking the first 7 characters?
 
-### 9.2 High-Concurrency Read Benchmark (`npx autocannon -c 200 -d 10 -p 10`)
+* **Answer:** Truncating a cryptographic hash introduces collisions due to the Birthday Paradox. Handling those collisions requires speculative database reads and retry loops, which slows down the write path. Using an **atomic 64-bit integer counter (Redis `INCR` or Twitter Snowflake) encoded directly to Base62** provides guaranteed collision-free IDs in $O(1)$ time without database roundtrips.
 
-- **Connections:** 200 concurrent connections, 10 pipelined requests.
-- **Observed Average Throughput:** **39,620 req/sec** (Peak second: **44,639 req/sec**).
-- **Observed Median Latency ($p50$):** **41 ms**.
-- **Total Redirects Handled:** 398,000 requests in 10.19 seconds.
+### Q2: Why return HTTP `302 Found` instead of `301 Moved Permanently`?
 
-### 9.3 Final Architectural Scorecard
+* **Answer:**
+  - `301 Moved Permanently` instructs the browser to cache the redirect indefinitely. Subsequent clicks bypass your servers completely, making it impossible to track analytics or expire/deactivate links.
+  - `302 Found` (or `307 Temporary Redirect`) forces the browser to query your service on every click, preserving accurate analytics and dynamic link management while caching is handled at the server and CDN layers.
 
-| Milestone             | Architecture State                                  | Read Throughput          | Median Latency ($p50$) | Max Latency      | Target Status               |
-| :-------------------- | :-------------------------------------------------- | :----------------------- | :----------------------- | :--------------- | :-------------------------- |
-| **Milestone 1** | Naive Monolith (Postgres writes inline)             | 1,588 req/sec            | 531 ms                   | 4,388 ms         | Failed (Row locks)          |
-| **Milestone 2** | Redis Cache-Aside + Buffered Clicks (1 Core)        | 16,344 req/sec           | 56 ms                    | 250 ms           | Met average SLA             |
-| **Milestone 3** | **Multi-Core Cluster + Redis + Auto Cleanup** | **39,620 req/sec** | **41 ms**          | **375 ms** | **Exceeded Peak SLA** |
+### Q3: How do you handle click analytics without slowing down redirects?
+
+* **Answer:** Decouple analytics into synchronous and asynchronous flows. The redirect path increments an in-memory counter in Redis (`INCR clicks:{code}`) and immediately returns the `302 Found` response in $< 1\text{ ms}$. A background worker periodically flushes accumulated counts to persistent storage in batches, completely avoiding row-level database locks.
+
+### Q4: How do you prevent cache-serving inconsistencies for expired links?
+
+* **Answer:** Use a hybrid expiration model:
+  1. Set the Redis cache TTL dynamically: $\text{TTL}_{\text{cache}} = \min(\text{remaining\_lifetime}, 86400)$.
+  2. Perform a passive expiration check on redirect; return `410 Gone` and delete the cache key if expired.
+  3. Run a low-frequency background cleanup job (every 60s) to batch-delete expired rows from the database.
+
+---
+
+## 7. Project File Structure Reference
+
+```text
+url_shortner/
+├── .env                                  # Environment secrets (PORT, DATABASE_URL, REDIS_URL)
+├── .env.example                          # Environment template
+├── .gitignore                            # Standard git ignore definitions
+├── package.json                          # Dependencies: express, @prisma/client, pg, ioredis
+├── prisma/
+│   ├── schema.prisma                     # Declarative PostgreSQL schema mapping
+│   └── migrations/                       # Deterministic SQL migration records
+└── src/
+    ├── config/
+    │   ├── db.js                         # PrismaClient singleton instance
+    │   └── redis.js                      # ioredis singleton with reconnection backoff
+    ├── controllers/
+    │   └── url.controller.js             # Core logic: Base62 atomic write, Cache-Aside read, 410 check
+    ├── routes/
+    │   └── url.routes.js                 # Express routes mounted with strict precedence
+    ├── utils/
+    │   ├── base62.js                     # Base62 conversion and atomic sequence helpers
+    │   └── validator.js                  # URL parsing, regex checks, and reserved keyword validation
+    ├── workers/
+    │   ├── analytics.flusher.js          # Background job: non-blocking SCAN + batch click updates
+    │   └── cleanup.worker.js             # Background job: purges expired links and cache entries
+    └── server.js                         # node:cluster setup: master supervisor + Express worker pool
+```
