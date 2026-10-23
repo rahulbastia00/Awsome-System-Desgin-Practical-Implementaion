@@ -1,0 +1,22 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Url {
+  id           String    @id @default(uuid())
+  shortCode    String    @unique @map("short_code") @db.VarChar(50)
+  longUrl      String    @map("long_url") @db.Text
+  userId       String?   @map("user_id") @db.VarChar(100)
+  clicks       BigInt    @default(0)
+  createdAt    DateTime  @default(now()) @map("created_at")
+  expiresAt    DateTime? @map("expires_at")
+  lastAccessed DateTime? @map("last_accessed")
+
+  @@index([createdAt])
+  @@map("urls")
+}
