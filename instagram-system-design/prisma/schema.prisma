@@ -1,0 +1,116 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ----------------------------------------------------
+// ENUMS
+// ----------------------------------------------------
+enum MediaType {
+  PHOTO
+  VIDEO
+}
+
+// ----------------------------------------------------
+// MODELS
+// ----------------------------------------------------
+
+model User {
+  user_id         BigInt    @id @default(autoincrement()) @map("user_id")
+  username        String    @unique @db.VarChar(50)
+  full_name       String    @map("full_name") @db.VarChar(100)
+  email           String    @unique @db.VarChar(255)
+  profile_pic_url String?   @map("profile_pic_url") @db.VarChar(500)
+  password_hash   String    @map("password_hash") @db.VarChar(255)
+  created_at      DateTime  @default(now()) @map("created_at")
+
+  // Relationships
+  posts           Post[]
+  comments        Comment[]
+  shares          Share[]
+
+  // Self-referential Many-to-Many follower relationships
+  following       Follower[] @relation("UserFollowing")
+  followers       Follower[] @relation("UserFollowers")
+
+  @@map("users")
+}
+
+model Post {
+  post_id     BigInt    @id @default(autoincrement()) @map("post_id")
+  user_id     BigInt    @map("user_id")
+  caption     String?   @db.Text
+  like_count  Int       @default(0) @map("like_count")
+  created_at  DateTime  @default(now()) @map("created_at")
+
+  // Relationships
+  user        User      @relation(fields: [user_id], references: [user_id], onDelete: Cascade)
+  media       Media[]
+  comments    Comment[]
+  shares      Share[]
+
+  @@index([user_id, created_at(sort: Desc)])
+  @@map("posts")
+}
+
+model Media {
+  media_id    BigInt    @id @default(autoincrement()) @map("media_id")
+  post_id     BigInt    @map("post_id")
+  media_url   String    @map("media_url") @db.VarChar(500)
+  media_type  MediaType @map("media_type")
+
+  // Relationships
+  post        Post      @relation(fields: [post_id], references: [post_id], onDelete: Cascade)
+
+  @@index([post_id])
+  @@map("media")
+}
+
+model Follower {
+  follower_id      BigInt   @map("follower_id")
+  followee_id      BigInt   @map("followee_id")
+  engagement_score Float    @default(0.0) @map("engagement_score")
+  created_at       DateTime @default(now()) @map("created_at")
+
+  // Relationships
+  follower         User     @relation("UserFollowing", fields: [follower_id], references: [user_id], onDelete: Cascade)
+  followee         User     @relation("UserFollowers", fields: [followee_id], references: [user_id], onDelete: Cascade)
+
+  @@id([follower_id, followee_id])
+  @@index([follower_id])
+  @@index([followee_id])
+  @@map("followers")
+}
+
+model Comment {
+  comment_id  BigInt    @id @default(autoincrement()) @map("comment_id")
+  post_id     BigInt    @map("post_id")
+  user_id     BigInt    @map("user_id")
+  content     String    @db.Text
+  created_at  DateTime  @default(now()) @map("created_at")
+
+  // Relationships
+  post        Post      @relation(fields: [post_id], references: [post_id], onDelete: Cascade)
+  user        User      @relation(fields: [user_id], references: [user_id], onDelete: Cascade)
+
+  @@index([post_id, created_at(sort: Asc)])
+  @@map("comments")
+}
+
+model Share {
+  share_id    BigInt    @id @default(autoincrement()) @map("share_id")
+  post_id     BigInt    @map("post_id")
+  user_id     BigInt    @map("user_id")
+  created_at  DateTime  @default(now()) @map("created_at")
+
+  // Relationships
+  post        Post      @relation(fields: [post_id], references: [post_id], onDelete: Cascade)
+  user        User      @relation(fields: [user_id], references: [user_id], onDelete: Cascade)
+
+  @@index([post_id])
+  @@map("shares")
+}
