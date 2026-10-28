@@ -1,5 +1,6 @@
 const prisma = require('../prisma');
 const localObjectStorage = require('../services/localObjectStorage');
+const redisQueue = require('../config/redisQueue');
 
 // ----------------------------------------------------
 // Controller Handlers
@@ -139,9 +140,25 @@ const createPost = async (req, res, next) => {
       },
     });
 
+    // Phase 3: Decouple background work by pushing POST_CREATED event to Redis Stream
+    const streamPayload = {
+      post_id: post.post_id.toString(),
+      user_id: post.user_id.toString(),
+      caption: post.caption,
+      media: post.media.map((m) => ({
+        media_id: m.media_id.toString(),
+        media_url: m.media_url,
+        media_type: m.media_type,
+      })),
+      created_at: post.created_at.toISOString(),
+    };
+
+    const streamMessageId = await redisQueue.publishPostCreatedEvent(streamPayload);
+
     return res.status(201).json({
       message: 'Post created successfully',
       post,
+      stream_event_id: streamMessageId,
     });
   } catch (err) {
     if (err instanceof TypeError || err.message?.includes('Cannot convert')) {
