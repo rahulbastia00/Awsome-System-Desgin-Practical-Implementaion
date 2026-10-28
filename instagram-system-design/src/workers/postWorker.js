@@ -35,10 +35,14 @@ async function processPostCreatedEvent(messageId, payload) {
     });
   }
 
-  // 1. Fan-Out-on-Write: Push post directly into Redis timelines of all followers
-  console.log(`[Worker ${CONSUMER_NAME}] 📡 Fanning out post to followers' Redis timelines...`);
+  // 1. Hybrid Fan-Out Strategy (Phase 5 Section 6.2)
+  console.log(`[Worker ${CONSUMER_NAME}] 📡 Processing Fan-Out for author ${payload.user_id}...`);
   const fanOutResult = await fanOutPostToFollowers(payload);
-  console.log(`[Worker ${CONSUMER_NAME}] 🚀 Fan-out complete: Pushed to ${fanOutResult.recipients_count} timeline(s) in ${fanOutResult.duration_ms}ms`);
+  if (fanOutResult.is_celebrity) {
+    console.log(`[Worker ${CONSUMER_NAME}] 🌟 CELEBRITY DETECTED (${fanOutResult.follower_count} followers). Skipped mass fan-out to prevent write amplification. Saved to celebrity timeline in ${fanOutResult.duration_ms}ms.`);
+  } else {
+    console.log(`[Worker ${CONSUMER_NAME}] 🚀 Fan-out complete: Pushed to ${fanOutResult.recipients_count} timeline(s) in ${fanOutResult.duration_ms}ms.`);
+  }
 
   // 2. Simulate other asynchronous background tasks (transcoding, notifications)
   console.log(`[Worker ${CONSUMER_NAME}] ⚙️  Simulating asynchronous thumbnail generation & notifications...`);
