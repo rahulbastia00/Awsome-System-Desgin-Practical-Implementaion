@@ -1,6 +1,7 @@
 const prisma = require('../prisma');
 const localObjectStorage = require('../services/localObjectStorage');
 const redisQueue = require('../config/redisQueue');
+const feedService = require('../services/feedService');
 
 // ----------------------------------------------------
 // Controller Handlers
@@ -170,7 +171,8 @@ const createPost = async (req, res, next) => {
 
 /**
  * 4. GET /api/v1/feed?page=1&limit=10
- * Returns paginated posts from authors followed by the authenticated user.
+ * Phase 4: Retrieves timeline directly from Redis (LRANGE).
+ * Falls back to PostgreSQL (fan-out on read) if cache is cold.
  */
 const getFeed = async (req, res, next) => {
   try {
@@ -182,56 +184,14 @@ const getFeed = async (req, res, next) => {
       });
     }
 
-    const userId = BigInt(rawUserId);
-
-    // Pagination validation
-    const pageNumber = Math.max(1, parseInt(req.query.page, 10) || 1);
-    const pageSize = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 10));
-    const skip = (pageNumber - 1) * pageSize;
-
-    // 1. Fetch user's followees (creators they follow)
-    const followedRelations = await prisma.follower.findMany({
-      where: { follower_id: userId },
-      select: { followee_id: true },
+    const { page, limit } = req.query;
+    const feedResult = await feedService.getUserTimeline({
+      userId: rawUserId,
+      page,
+      limit,
     });
 
-    const followedIds = followedRelations.map((r) => r.followee_id);
-
-    // Include the user's own posts in their feed as well
-    const feedAuthorIds = [...followedIds, userId];
-
-    // 2. Fetch posts from these creators, ordered reverse-chronologically
-    const posts = await prisma.post.findMany({
-      where: {
-        user_id: { in: feedAuthorIds },
-      },
-      skip,
-      take: pageSize,
-      orderBy: { created_at: 'desc' },
-      include: {
-        media: true,
-        user: {
-          select: {
-            user_id: true,
-            username: true,
-            profile_pic_url: true,
-          },
-        },
-        _count: {
-          select: {
-            comments: true,
-            shares: true,
-          },
-        },
-      },
-    });
-
-    return res.status(200).json({
-      page: pageNumber,
-      limit: pageSize,
-      total_items: posts.length,
-      feed: posts,
-    });
+    return res.status(200).json(feedResult);
   } catch (err) {
     if (err instanceof TypeError || err.message?.includes('Cannot convert')) {
       return res.status(400).json({ error: 'Invalid user ID format. Must be an integer.' });

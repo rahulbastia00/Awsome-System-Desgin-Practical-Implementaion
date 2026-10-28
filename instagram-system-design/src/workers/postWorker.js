@@ -1,6 +1,7 @@
 require('dotenv').config();
 const Redis = require('ioredis');
 const { initConsumerGroup, STREAM_KEY, CONSUMER_GROUP } = require('../config/redisQueue');
+const { fanOutPostToFollowers } = require('../services/feedService');
 
 const REDIS_URL = process.env.REDIS_URL || 'redis://localhost:6379';
 const CONSUMER_NAME = process.env.CONSUMER_NAME || `worker-${process.pid}`;
@@ -15,10 +16,9 @@ const redis = new Redis(REDIS_URL, {
 let isRunning = true;
 
 /**
- * Simulates asynchronous downstream tasks:
- * 1. Image transcoding / thumbnail generation
- * 2. Feed cache fan-out preparation
- * 3. Search index update & engagement auditing
+ * Executes asynchronous downstream tasks:
+ * 1. Fan-out-on-write to Redis timelines (LPUSH into feed:{follower_id})
+ * 2. Media thumbnail generation & push notifications
  */
 async function processPostCreatedEvent(messageId, payload) {
   const startTime = Date.now();
@@ -35,12 +35,17 @@ async function processPostCreatedEvent(messageId, payload) {
     });
   }
 
-  // Simulate heavy background asynchronous workload (transcoding, fan-out, notifications)
-  console.log(`[Worker ${CONSUMER_NAME}] ⚙️  Simulating asynchronous thumbnail generation & feed fan-out...`);
-  await new Promise((resolve) => setTimeout(resolve, 800));
+  // 1. Fan-Out-on-Write: Push post directly into Redis timelines of all followers
+  console.log(`[Worker ${CONSUMER_NAME}] 📡 Fanning out post to followers' Redis timelines...`);
+  const fanOutResult = await fanOutPostToFollowers(payload);
+  console.log(`[Worker ${CONSUMER_NAME}] 🚀 Fan-out complete: Pushed to ${fanOutResult.recipients_count} timeline(s) in ${fanOutResult.duration_ms}ms`);
 
-  const durationMs = Date.now() - startTime;
-  console.log(`[Worker ${CONSUMER_NAME}] ✅ Successfully processed Post ID ${payload.post_id} in ${durationMs}ms`);
+  // 2. Simulate other asynchronous background tasks (transcoding, notifications)
+  console.log(`[Worker ${CONSUMER_NAME}] ⚙️  Simulating asynchronous thumbnail generation & notifications...`);
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  const totalDurationMs = Date.now() - startTime;
+  console.log(`[Worker ${CONSUMER_NAME}] ✅ Successfully finished Post ID ${payload.post_id} in ${totalDurationMs}ms`);
   console.log(`======================================================\n`);
 }
 
